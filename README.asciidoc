@@ -1,0 +1,109 @@
+= ElasticSearch C# Channels Slow Memory Leak
+
+This repository can be used to demonstrate a slow but consistent memory leak
+for long-lived applications (e.g. web applications) that is caused by Elastic.Channel's
+usage of System.Threading.Channels as identified in
+https://github.com/dotnet/runtime/issues/761[this issue].
+
+
+(for a more similar presentation of the issue, see 
+https://github.com/dotnet/runtime/issues/80057[this other issue])
+
+== Summary of Issue
+
+According to the comments on https://github.com/dotnet/runtime/issues/761[this issue],
+the Microsoft engineering team for ``System.Threading.Channels`` decided to hang onto
+old references related to cancelled ``AsyncOperation``s in the queue, instead of manually
+disposing them because of "performance / simplicity" interests. Their expectation is:
+[quote]
+----
+...the moment you write to the bounded channel, you'll see all of those objects become unrooted and become available to the GC, because the write will end up pulling out all of the canceled objects from the queue...
+----
+However, in our testing, subsequent writing of logs to ElasticSearch does not result in garbage collection
+of the ``System.OperationCanceledException`` objects that get generated, even under heavy memory pressure.
+
+In that same issue, their engineering team is considering a rewrite of their implementation to use doubly-linked lists
+and handle the cancelation callbacks correctly. However, there has been no movement on this plan, and they have numerous other use cases for the ``System.Threading.Channels`` package to consider. 
+
+=== Real-World Use Case Description
+
+Consider a website which is made up of:
+
+* a system of distinct microservices
+* each microservice has multiple instances for scaling
+* each instance is long-lived (2+ weeks uptime)
+* each instance send log messages to a central ElasticSearch repository
+
+While this memory leak is slow and small, it becomes apparent and a real memory-pressure issue
+in a scenario where hundreds of microservice instances suffer from the leak over weeks.
+
+== Requirements
+
+* (Optional) a running instance of ElasticSearch 8.x. The sample application assumes localhost:9200, but this can be changed: 
+[source,csharp]
+----
+var pool = new StaticNodePool(new[]
+{
+    new Uri("https://elastic:changeme@localhost:9200"),
+});
+----
+* A version Visual Studio with memory profiling tools, specifically the *Diagnostic Tools* window that is available (in VS2022) under ``Debug > Windows > Show Diagnostic Tools``
+
+== Reproduction Steps
+. (Optionally) modify the application to uncomment which version of the code you want to try. Any one of these lines can be used to reproduce the issue
+[source,csharp]
+----
+// ActualUseCase();
+
+// var sink = new ElasticsearchSink(new ElasticsearchSinkOptions());
+
+// var channel = new EcsDataStreamChannel<EcsDocument>(new DataStreamChannelOptions<EcsDocument>(null));
+
+// var noopChannel = new NoopBufferedChannel(new NoopBufferedChannel.NoopChannelOptions());
+
+var dummyChannelBase = new DummyBufferedChannel(new DummyBufferedChannelOptions());
+----
+
+. Run the application
+. Wait for the application to initialize and enter the main loop
+. In the Visual Studio *Diagnostic Tools* window note the ``System.OperationCancelled`` exception that is thrown every 5 seconds
+image:docs/images/5-second-exceptions.png[]
+. In the *Memory Usage* tab of the *Diagnostics Tools* window, take multiple snapshots, preferably minutes or even hours apart
+. Select two snapshots and compare them (*View Diff*). Note the number of uncollected ``System.OperationCancelled`` exceptions and related objects will continue to go up and will not be garbage collected, even under heavy memory constraints. In our testing this will continue steadily over days/weeks until ``System.OutOfMemoryException``s are thrown by related processes
+image:docs/images/mem-dumps.png[]
+image:docs/images/mem-diff.png[]
+image:docs/images/mem-diff-2.png[]
+* Optional: if using the ``ActualUseCase`` version of the code, write some logs to elastic through the console. Note that garbage collection events do not resolve the hanging ``System.OutOfMemoryException``s in subsequent snapshots
+
+== Current Workarounds
+
+There are a couple of options to work around this issue or at least minimize it.
+
+=== Option 1 to make the leak go slower
+
+In your buffer options, set the ``OutboundBufferMaxLifetime`` to a ``TimeSpan`` longer than the default of 5 seconds. Note that this will not completely remove the memory leak issue, and will increase the latency and risk of data loss on system failure.
+
+=== Option 2 to remove the issue
+
+This options requires code changes to the Elastic.Channels assembly code, in ``/src/Elastic.Channels/Buffers/InboundBuffer.cs``, and specifically in the ``WaitToReadAsync`` method.
+
+Because the intent of this ``CancellationTokenSource`` is to batch records together but make sure they do not wait longer than a given period to be sent, instead of letting ``System.Threading.Channels`` handle the ``CancellationTokenSource``, handle it yourself. This is a bit messier, but does get rid of the memory leak while preserving functionality. In the main ``try`` loop of the ``WaitToReadAsync`` method, do the following instead:
+
+[code,csharp]
+----
+try
+{
+    _breaker.CancelAfter(Wait);
+    var readTask = reader.WaitToReadAsync().AsTask();
+    var delayTask = Task.Delay(Timeout.Infinite, _breaker.Token);
+    var completedTask = await Task.WhenAny(readTask, delayTask).ConfigureAwait(false);
+
+    if (completedTask == delayTask)
+    {
+        throw new OperationCanceledException(_breaker.Token);
+    }
+
+    _breaker.CancelAfter(-1);
+    return await readTask.ConfigureAwait(false);
+}
+----
